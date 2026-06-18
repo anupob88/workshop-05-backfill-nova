@@ -27,9 +27,10 @@ def init_db():
     db = get_db()
     
     db.executescript("""
-        -- Messages table (source of truth)
+        -- Messages table (source of truth) — append-only versioned store
         CREATE TABLE IF NOT EXISTS messages (
-            id TEXT PRIMARY KEY,
+            id TEXT NOT NULL,
+            version INTEGER DEFAULT 1,
             channel_id TEXT NOT NULL,
             channel_name TEXT,
             author TEXT,
@@ -38,7 +39,10 @@ def init_db():
             content TEXT,
             has_attachments INTEGER DEFAULT 0,
             attachment_count INTEGER DEFAULT 0,
-            raw_json TEXT
+            raw_json TEXT,
+            prev_version_id TEXT,
+            is_tombstone INTEGER DEFAULT 0,
+            PRIMARY KEY (id, version)
         );
         
         -- FTS5 virtual table for full-text search
@@ -82,9 +86,12 @@ def index_all(reindex: bool = False) -> dict:
     db = init_db()
     
     if reindex:
-        db.execute("DELETE FROM messages")
-        db.execute("DELETE FROM messages_fts")
+        db.execute("DROP TABLE IF EXISTS messages")
+        db.execute("DROP TABLE IF EXISTS messages_fts")
         db.execute("DELETE FROM index_meta")
+        # Re-initialize fresh schema
+        db.close()
+        db = init_db()
     
     total = 0
     new = 0
@@ -111,32 +118,44 @@ def index_all(reindex: bool = False) -> dict:
                 for msg in messages:
                     total += 1
                     
-                    # Check if already indexed
+                    # Append-only versioned store (inspired by Tonk — Principle 1)
+                    # Check if same content already indexed
                     existing = db.execute(
-                        "SELECT id FROM messages WHERE id = ?",
+                        "SELECT id, version, content FROM messages WHERE id = ? ORDER BY version DESC LIMIT 1",
                         (msg["id"],)
                     ).fetchone()
-                    
+
+                    new_content = msg.get("content", "")
+
                     if existing:
-                        continue
-                    
+                        if existing["content"] == new_content:
+                            continue  # Same content, skip
+                        # Content changed — insert new version
+                        version = existing["version"] + 1
+                        prev_id = existing["id"]
+                    else:
+                        version = 1
+                        prev_id = None
+
                     new += 1
                     channels[channel_id] += 1
-                    
+
                     db.execute("""
-                        INSERT INTO messages (id, channel_id, channel_name, author, author_id, timestamp, content, has_attachments, attachment_count, raw_json)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO messages (id, version, channel_id, channel_name, author, author_id, timestamp, content, has_attachments, attachment_count, raw_json, prev_version_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         msg["id"],
+                        version,
                         msg.get("channel_id", channel_id),
                         msg.get("channel_name", ""),
                         msg.get("author", ""),
                         msg.get("author_id", ""),
                         msg.get("timestamp", ""),
-                        msg.get("content", ""),
+                        new_content,
                         1 if msg.get("attachments") else 0,
                         len(msg.get("attachments", [])),
-                        json.dumps(msg, ensure_ascii=False)
+                        json.dumps(msg, ensure_ascii=False),
+                        prev_id
                     ))
             except Exception as e:
                 print(f"  Error reading {daily_file}: {e}")
@@ -157,20 +176,68 @@ def index_all(reindex: bool = False) -> dict:
     }
 
 
+def parity() -> dict:
+    """Parity gate — compare backfill JSON count vs SQLite count (inspired by Atom #19)"""
+    db = get_db()
+
+    # Count JSON files in backfill directory
+    json_count = 0
+    for channel_dir in BACKFILL_ROOT.iterdir():
+        if not channel_dir.is_dir() or channel_dir.name == "search.db":
+            continue
+        for date_dir in channel_dir.iterdir():
+            if not date_dir.is_dir():
+                continue
+            daily_file = date_dir / "_daily.json"
+            if daily_file.exists():
+                msgs = json.loads(daily_file.read_text(encoding="utf-8"))
+                json_count += len(msgs)
+
+    # Count unique messages in SQLite (latest version only)
+    db_count = db.execute(
+        "SELECT COUNT(DISTINCT id) FROM messages WHERE is_tombstone = 0"
+    ).fetchone()[0]
+
+    db.close()
+
+    missing = json_count - db_count
+    return {
+        "json_count": json_count,
+        "db_count": db_count,
+        "parity": missing == 0,
+        "missing": missing,
+        "extra": -missing if missing < 0 else 0
+    }
+
+
 def check() -> dict:
     """Check index health"""
     db = get_db()
-    
+
     msg_count = db.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     fts_count = db.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
     meta = {row["key"]: row["value"] for row in db.execute("SELECT * FROM index_meta").fetchall()}
-    
+
+    # Version stats
+    versioned = db.execute(
+        "SELECT COUNT(*) as cnt FROM messages WHERE version > 1"
+    ).fetchone()[0]
+
+    tombstoned = db.execute(
+        "SELECT COUNT(*) as cnt FROM messages WHERE is_tombstone = 1"
+    ).fetchone()[0]
+
     db.close()
-    
+
+    parity_result = parity()
+
     return {
         "messages_in_db": msg_count,
         "fts_documents": fts_count,
         "in_sync": msg_count == fts_count,
+        "parity": parity_result,
+        "versioned_messages": versioned,
+        "tombstoned_messages": tombstoned,
         "last_index": meta.get("last_index", "never"),
         "db_size": os.path.getsize(DB_PATH) if DB_PATH.exists() else 0
     }
@@ -178,14 +245,15 @@ def check() -> dict:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: indexer.py <build|check|rebuild>")
-        print("  build    Index new messages (incremental)")
+        print("Usage: indexer.py <build|check|rebuild|parity>")
+        print("  build    Index new messages (incremental, append-only)")
         print("  rebuild  Reindex everything from scratch")
-        print("  check    Check index health")
+        print("  check    Check index health + parity gate")
+        print("  parity   Run parity gate: JSON count vs DB count")
         sys.exit(1)
-    
+
     cmd = sys.argv[1]
-    
+
     if cmd == "build":
         result = index_all(reindex=False)
         print(f"\n=== Index Build Complete ===")
@@ -195,21 +263,34 @@ if __name__ == "__main__":
         print(f"\nBy channel:")
         for ch, count in result['channels'].items():
             print(f"  {ch}: {count} msgs")
-    
+
     elif cmd == "rebuild":
         result = index_all(reindex=True)
         print(f"\n=== Full Rebuild Complete ===")
         print(f"Total indexed: {result['new_indexed']}")
         print(f"DB path: {result['db_path']}")
-    
+
+    elif cmd == "parity":
+        p = parity()
+        print(f"\n=== Parity Gate ===")
+        print(f"JSON (backfill dir): {p['json_count']}")
+        print(f"SQLite (DB): {p['db_count']}")
+        print(f"Parity: {'PASS' if p['parity'] else 'FAIL — missing ' + str(p['missing']) + ', extra ' + str(p['extra'])}")
+
     elif cmd == "check":
         status = check()
         print(f"\n=== Index Health ===")
         print(f"Messages in DB: {status['messages_in_db']}")
         print(f"FTS documents: {status['fts_documents']}")
         print(f"In sync: {'Yes' if status['in_sync'] else 'No - needs rebuild'}")
+        print(f"Versioned (edited): {status['versioned_messages']}")
+        print(f"Tombstoned (deleted): {status['tombstoned_messages']}")
+        print(f"Parity gate: {'PASS' if status['parity']['parity'] else 'FAIL'}")
+        if not status['parity']['parity']:
+            print(f"  JSON: {status['parity']['json_count']}, DB: {status['parity']['db_count']}")
+            print(f"  Missing: {status['parity']['missing']}, Extra: {status['parity']['extra']}")
         print(f"Last index: {status['last_index']}")
         print(f"DB size: {status['db_size']:,} bytes")
-    
+
     else:
         print(f"Unknown command: {cmd}")
